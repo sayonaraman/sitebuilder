@@ -101,8 +101,6 @@ if [[ -f "${INDEX_PATH}" ]]; then
   # Remove PostHog analytics script block
   sed -i '/posthog\.init/,/<\/script>/d' "${INDEX_PATH}" || true
   sed -i '/i\.posthog\.com/d' "${INDEX_PATH}" || true
-  # Also remove any IIFE snippet that ends with "window.posthog || []);"
-  sed -i '/!(function/,/window\.posthog\s*\|\|\s*\[\]\);/d' "${INDEX_PATH}" || true
   # Fallback: aggressively remove any <script> that contains the word "posthog"
   if command -v perl >/dev/null 2>&1; then
     perl -0777 -pe 's#<script[\s\S]*?posthog[\s\S]*?</script>##g' -i "${INDEX_PATH}" || true
