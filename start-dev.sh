@@ -90,15 +90,13 @@ else
 fi
 popd >/dev/null
 
-# Branding updates in public HTML (title and Emergent → pixbit.pro)
+# Branding updates in public HTML: adjust title; keep JS and structure intact
 INDEX_PATH="frontend/public/index.html"
 if [[ -f "${INDEX_PATH}" ]]; then
   # 1) Title
   sed -i 's#<title>[^<]*</title>#<title>'"${SITE_TITLE}"'</title>#' "${INDEX_PATH}" || true
-  # 2) Links and labels
-  sed -i 's#https\?://app\.emergent\.sh[^"\x27]*#https://pixbit.pro#g' "${INDEX_PATH}" || true
-  sed -i 's#emergent\.sh#pixbit.pro#g' "${INDEX_PATH}" || true
-  sed -i 's#Emergent#pixbit.pro#g' "${INDEX_PATH}" || true
+  # 2) Replace only visible text label; do NOT touch scripts/links
+  sed -i 's#Made with Emergent#pixbit.pro#g' "${INDEX_PATH}" || true
 fi
 
 # Start backend and frontend
