@@ -98,6 +98,9 @@ if [[ -f "${INDEX_PATH}" ]]; then
   sed -i '/id="emergent-badge"/,/<\/a>/d' "${INDEX_PATH}" || true
   # Remove emergent.sh meta
   sed -i '/emergent\.sh/d' "${INDEX_PATH}" || true
+  # Remove PostHog analytics script block
+  sed -i '/posthog\.init/,/<\/script>/d' "${INDEX_PATH}" || true
+  sed -i '/i\.posthog\.com/d' "${INDEX_PATH}" || true
   # Replace title tag with prepared title
   sed -i 's#<title>.*</title>#<title>'"${SITE_TITLE}"'</title>#g' "${INDEX_PATH}" || true
 fi
