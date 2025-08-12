@@ -57,7 +57,9 @@ echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT}"
 
 # Prepared, constant site title (change here if needed)
 SITE_TITLE="${SITE_TITLE:-test-pixbit.pro}"
-BRAND_DOMAIN="${BRAND_DOMAIN:-pixbit.pro}"
+BUTTON_TEXT="${BUTTON_TEXT:-pixbit.pro}"
+BUTTON_HREF="${BUTTON_HREF:-https://pixbit.pro}"
+FAVICON_URL="${FAVICON_URL:-}"
 
 # Ensure backend .env exists with sensible defaults
 if [[ ! -f backend/.env ]]; then
@@ -98,12 +100,20 @@ INDEX_PATH="frontend/public/index.html"
 if [[ -f "${INDEX_PATH}" ]]; then
   # 1) Title
   sed -i 's#<title>[^<]*</title>#<title>'"${SITE_TITLE}"'</title>#' "${INDEX_PATH}" || true
-  # 2) Replace only in safe spots: visible badge text and its href; keep JS intact
-  sed -i "s#Made with Emergent#${BRAND_DOMAIN}#g" "${INDEX_PATH}" || true
-  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#https\?://app\\.emergent\\.sh[^'\"]*#https://${BRAND_DOMAIN}#g }" "${INDEX_PATH}" || true
-  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#Emergent#${BRAND_DOMAIN}#g }" "${INDEX_PATH}" || true
+  # 2) Badge text and href; keep JS intact
+  sed -i "s#Made with Emergent#${BUTTON_TEXT}#g" "${INDEX_PATH}" || true
+  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#https\?://app\\.emergent\\.sh[^'\"]*#${BUTTON_HREF}#g }" "${INDEX_PATH}" || true
+  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#Emergent#${BUTTON_TEXT}#g }" "${INDEX_PATH}" || true
   # 3) Meta description line only, if contains emergent.sh
-  sed -i -E "s#(<meta[^>]*name=[\"']description[\"'][^>]*content=[\"'][^\"']*)emergent\\.sh([^\"']*[\"'])#\1${BRAND_DOMAIN}\2#I" "${INDEX_PATH}" || true
+  sed -i -E "s#(<meta[^>]*name=[\"']description[\"'][^>]*content=[\"'][^\"']*)emergent\\.sh([^\"']*[\"'])#\1${BUTTON_TEXT}\2#I" "${INDEX_PATH}" || true
+  # 4) Favicon (if provided)
+  if [[ -n "${FAVICON_URL}" ]]; then
+    if grep -qi '<link[^>]*rel=["\'']icon' "${INDEX_PATH}"; then
+      sed -i -E "s#<link[^>]*rel=[\"']icon[\"'][^>]*>#<link rel=\"icon\" href=\"${FAVICON_URL}\"/>#Ig" "${INDEX_PATH}" || true
+    else
+      sed -i "s#</head>#  <link rel=\"icon\" href=\"${FAVICON_URL}\"/>\n</head>#" "${INDEX_PATH}" || true
+    fi
+  fi
 fi
 
 # Start backend and frontend
