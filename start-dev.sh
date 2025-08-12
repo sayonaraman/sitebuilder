@@ -9,10 +9,14 @@ echo "================================"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Global lock to avoid port race between multiple projects starting concurrently
-PORT_LOCK="/tmp/site_ports.lock"
-exec 200>"${PORT_LOCK}"
-flock 200
+# Global lock to avoid port race between multiple projects starting concurrently (optional if flock not available)
+HAVE_LOCK=0
+if command -v flock >/dev/null 2>&1; then
+  PORT_LOCK="/tmp/site_ports.lock"
+  exec 200>"${PORT_LOCK}"
+  flock 200 || true
+  HAVE_LOCK=1
+fi
 
 # Pre-flight checks
 if ! command -v python3 >/dev/null 2>&1; then
@@ -208,8 +212,10 @@ popd >/dev/null
 wait_for_listen "${BACKEND_PORT}" 40 0.25 || true
 wait_for_listen "${FRONTEND_PORT}" 40 0.25 || true
 
-# Release global lock
-flock -u 200
+# Release global lock if taken
+if [[ "$HAVE_LOCK" -eq 1 ]]; then
+  flock -u 200 || true
+fi
 
 echo "Servers are starting in background."
 echo "Backend:  http://${SERVER_HOST}:${BACKEND_PORT}  (pid: ${BACK_PID})"
