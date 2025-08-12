@@ -9,14 +9,13 @@ echo "================================"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Global lock to avoid port race between multiple projects starting concurrently (optional if flock not available)
-HAVE_LOCK=0
-if command -v flock >/dev/null 2>&1; then
-  PORT_LOCK="/tmp/site_ports.lock"
-  exec 200>"${PORT_LOCK}"
-  flock 200 || true
-  HAVE_LOCK=1
-fi
+# Define project name and registry path
+PROJECT_NAME="$(basename "$SCRIPT_DIR")"
+REGISTRY_PATH="$(dirname "$SCRIPT_DIR")/.port-registry.json"
+REGISTRY_LOCK="$REGISTRY_PATH.lock"
+
+echo "Project: $PROJECT_NAME"
+echo "Registry: $REGISTRY_PATH"
 
 # Pre-flight checks
 if ! command -v python3 >/dev/null 2>&1; then
@@ -29,6 +28,196 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "[ERROR] jq is not installed. Please install jq for JSON processing." >&2
+  exit 1
+fi
+
+# Registry management functions
+acquire_registry_lock() {
+  local timeout=10
+  local count=0
+  while [[ -f "$REGISTRY_LOCK" ]] && [[ $count -lt $timeout ]]; do
+    sleep 0.5
+    count=$((count + 1))
+  done
+  
+  if [[ $count -ge $timeout ]]; then
+    echo "[WARNING] Registry lock timeout, proceeding anyway..."
+    rm -f "$REGISTRY_LOCK"
+  fi
+  
+  echo $$ > "$REGISTRY_LOCK"
+}
+
+release_registry_lock() {
+  rm -f "$REGISTRY_LOCK"
+}
+
+# Cleanup lock on exit
+cleanup_lock() {
+  release_registry_lock
+}
+trap cleanup_lock EXIT
+
+read_registry() {
+  if [[ ! -f "$REGISTRY_PATH" ]]; then
+    echo "{}"
+    return
+  fi
+  cat "$REGISTRY_PATH"
+}
+
+write_registry() {
+  local registry_data="$1"
+  echo "$registry_data" > "$REGISTRY_PATH.tmp"
+  mv "$REGISTRY_PATH.tmp" "$REGISTRY_PATH"
+}
+
+is_process_running() {
+  local pid="$1"
+  [[ -n "$pid" ]] && [[ "$pid" != "null" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+is_port_in_use() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -i TCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
+  else
+    # Fallback to ss
+    ss -ltn | awk '{print $4}' | grep -E "(:|\])${port}$" >/dev/null 2>&1
+  fi
+}
+
+get_used_ports_from_registry() {
+  local registry_data="$1"
+  echo "$registry_data" | jq -r '.[] | select(.frontend_port != null and .backend_port != null) | "\(.frontend_port)\n\(.backend_port)"' 2>/dev/null || true
+}
+
+find_free_port() {
+  local start_port="$1"
+  local registry_data="$2"
+  local used_ports
+  used_ports=$(get_used_ports_from_registry "$registry_data")
+  
+  local port="$start_port"
+  while true; do
+    # Check if port is in use by system
+    if is_port_in_use "$port"; then
+      port=$((port + 1))
+      continue
+    fi
+    
+    # Check if port is reserved in registry
+    if echo "$used_ports" | grep -q "^$port$"; then
+      port=$((port + 1))
+      continue
+    fi
+    
+    echo "$port"
+    return
+  done
+}
+
+cleanup_dead_processes() {
+  local registry_data="$1"
+  local updated_registry="$registry_data"
+  
+  # Get all project names
+  local projects
+  projects=$(echo "$registry_data" | jq -r 'keys[]' 2>/dev/null || echo "")
+  
+  for project in $projects; do
+    local frontend_pid backend_pid
+    frontend_pid=$(echo "$registry_data" | jq -r ".[\"$project\"].pid_frontend // \"null\"")
+    backend_pid=$(echo "$registry_data" | jq -r ".[\"$project\"].pid_backend // \"null\"")
+    
+    # Check if processes are still running
+    local frontend_running=false
+    local backend_running=false
+    
+    if is_process_running "$frontend_pid"; then
+      frontend_running=true
+    fi
+    
+    if is_process_running "$backend_pid"; then
+      backend_running=true
+    fi
+    
+    # If both processes are dead, mark PIDs as null
+    if [[ "$frontend_running" == false ]] && [[ "$backend_running" == false ]]; then
+      echo "[INFO] Cleaning up dead processes for project: $project"
+      updated_registry=$(echo "$updated_registry" | jq ".[\"$project\"].pid_frontend = null | .[\"$project\"].pid_backend = null")
+    fi
+  done
+  
+  echo "$updated_registry"
+}
+
+# Port management with registry
+acquire_registry_lock
+
+echo "Reading port registry..."
+registry_data=$(read_registry)
+
+echo "Cleaning up dead processes..."
+registry_data=$(cleanup_dead_processes "$registry_data")
+
+# Check if project already has assigned ports
+existing_frontend=$(echo "$registry_data" | jq -r ".[\"$PROJECT_NAME\"].frontend_port // \"null\"")
+existing_backend=$(echo "$registry_data" | jq -r ".[\"$PROJECT_NAME\"].backend_port // \"null\"")
+existing_frontend_pid=$(echo "$registry_data" | jq -r ".[\"$PROJECT_NAME\"].pid_frontend // \"null\"")
+existing_backend_pid=$(echo "$registry_data" | jq -r ".[\"$PROJECT_NAME\"].pid_backend // \"null\"")
+
+FRONTEND_PORT=""
+BACKEND_PORT=""
+
+# Check if existing ports are still available
+if [[ "$existing_frontend" != "null" ]] && [[ "$existing_backend" != "null" ]]; then
+  # Check if processes are running
+  frontend_running=false
+  backend_running=false
+  
+  if is_process_running "$existing_frontend_pid"; then
+    frontend_running=true
+  fi
+  
+  if is_process_running "$existing_backend_pid"; then
+    backend_running=true
+  fi
+  
+  # If both processes are running, we can't use these ports
+  if [[ "$frontend_running" == true ]] && [[ "$backend_running" == true ]]; then
+    echo "[ERROR] Project $PROJECT_NAME is already running on ports $existing_frontend (frontend) and $existing_backend (backend)"
+    echo "PIDs: frontend=$existing_frontend_pid, backend=$existing_backend_pid"
+    release_registry_lock
+    exit 1
+  fi
+  
+  # If ports are not in use by other processes, reuse them
+  if ! is_port_in_use "$existing_frontend" && ! is_port_in_use "$existing_backend"; then
+    FRONTEND_PORT="$existing_frontend"
+    BACKEND_PORT="$existing_backend"
+    echo "Reusing existing ports for $PROJECT_NAME: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
+  fi
+fi
+
+# If we don't have ports yet, find new ones
+if [[ -z "$FRONTEND_PORT" ]] || [[ -z "$BACKEND_PORT" ]]; then
+  echo "Finding new free ports..."
+  FRONTEND_PORT="${FRONTEND_START_PORT:-$(find_free_port 3000 "$registry_data")}"
+  BACKEND_PORT="${BACKEND_START_PORT:-$(find_free_port 8000 "$registry_data")}"
+  
+  # Make sure backend port doesn't conflict with frontend
+  if [[ "$BACKEND_PORT" == "$FRONTEND_PORT" ]]; then
+    BACKEND_PORT=$(find_free_port $((BACKEND_PORT + 1)) "$registry_data")
+  fi
+  
+  echo "Allocated new ports for $PROJECT_NAME: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
+fi
+
+echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT}"
+
 # Create root-level venv if missing
 if [[ ! -f "venv/bin/python" ]]; then
   echo "Creating virtual environment in $PWD/venv ..."
@@ -40,94 +229,6 @@ venv/bin/python -m pip install --upgrade pip
 
 echo "Installing backend dependencies..."
 venv/bin/python -m pip install -r backend/requirements.txt
-
-# Find free ports utilities
-is_port_in_use() {
-  local port="$1"
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -i TCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
-  else
-    # Fallback to ss
-    ss -ltn | awk '{print $4}' | grep -E "(:|\])${port}$" >/dev/null 2>&1
-  fi
-}
-
-find_free_port() {
-  local port="$1"
-  while is_port_in_use "$port"; do
-    port=$((port + 1))
-  done
-  echo "$port"
-}
-
-# Wait until a port starts listening (or timeout)
-wait_for_listen() {
-  local port="$1"; local attempts="${2:-20}"; local sleep_s="${3:-0.5}"
-  local i=0
-  while (( i < attempts )); do
-    if is_port_in_use "$port"; then return 0; fi
-    i=$((i+1))
-    sleep "$sleep_s"
-  done
-  return 1
-}
-
-# Derive deterministic offset from project name to avoid collisions across projects
-PROJECT_NAME="$(basename "$SCRIPT_DIR")"
-PORT_OFFSET=$(( $(echo -n "$PROJECT_NAME" | cksum | awk '{print $1}') % 900 ))
-DEFAULT_FRONT_START=$(( 3000 + PORT_OFFSET ))
-DEFAULT_BACK_START=$(( 8000 + PORT_OFFSET ))
-
-# Port registry persisted across projects to ensure unique stable assignments
-REGISTRY_FILE="/var/tmp/site_ports_registry"
-touch "$REGISTRY_FILE"
-
-registry_get_line() {
-  grep -E "^${PROJECT_NAME}[[:space:]]" "$REGISTRY_FILE" | tail -1 || true
-}
-
-registry_port_taken() {
-  local port="$1"
-  grep -E "[[:space:]](FRONT=${port}|BACK=${port})([[:space:]]|$)" "$REGISTRY_FILE" >/dev/null 2>&1
-}
-
-registry_set_line() {
-  local front="$1"; local back="$2"
-  # remove old line and append new
-  grep -v -E "^${PROJECT_NAME}[[:space:]]" "$REGISTRY_FILE" > "${REGISTRY_FILE}.tmp" 2>/dev/null || true
-  mv -f "${REGISTRY_FILE}.tmp" "$REGISTRY_FILE" 2>/dev/null || true
-  echo "${PROJECT_NAME} FRONT=${front} BACK=${back}" >> "$REGISTRY_FILE"
-}
-
-# Decide ports
-EXPLICIT_FRONT="${FRONTEND_START_PORT:-}"
-EXPLICIT_BACK="${BACKEND_START_PORT:-}"
-if [[ -n "$EXPLICIT_FRONT" && -n "$EXPLICIT_BACK" ]]; then
-  FRONT_START="$EXPLICIT_FRONT"; BACK_START="$EXPLICIT_BACK"
-  FRONTEND_PORT="$(find_free_port "$FRONT_START")"
-  BACKEND_PORT="$(find_free_port "$BACK_START")"
-  registry_set_line "$FRONTEND_PORT" "$BACKEND_PORT"
-else
-  # check registry first
-  LINE="$(registry_get_line)"
-  if [[ -n "$LINE" ]]; then
-    FRONTEND_PORT="$(echo "$LINE" | sed -n 's/.*FRONT=\([0-9]\+\).*/\1/p')"
-    BACKEND_PORT="$(echo "$LINE" | sed -n 's/.*BACK=\([0-9]\+\).*/\1/p')"
-  fi
-  # If missing or currently busy, compute new unique ports
-  if [[ -z "${FRONTEND_PORT:-}" || -z "${BACKEND_PORT:-}" || is_port_in_use "$FRONTEND_PORT" || is_port_in_use "$BACKEND_PORT" ]]; then
-    FRONT_START="${EXPLICIT_FRONT:-$DEFAULT_FRONT_START}"
-    BACK_START="${EXPLICIT_BACK:-$DEFAULT_BACK_START}"
-    # ensure not taken in registry and not listening
-    CAND_F="$FRONT_START"; CAND_B="$BACK_START"
-    while registry_port_taken "$CAND_F" || is_port_in_use "$CAND_F"; do CAND_F=$((CAND_F+1)); done
-    while registry_port_taken "$CAND_B" || is_port_in_use "$CAND_B"; do CAND_B=$((CAND_B+1)); done
-    FRONTEND_PORT="$CAND_F"; BACKEND_PORT="$CAND_B"
-    registry_set_line "$FRONTEND_PORT" "$BACKEND_PORT"
-  fi
-fi
-
-echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT} (project ${PROJECT_NAME})"
 
 # Prepared, constant site title (change here if needed)
 SITE_TITLE="${SITE_TITLE:-test-pixbit.pro}"
@@ -208,28 +309,49 @@ fi
 FRONT_PID=$!
 popd >/dev/null
 
-# Wait briefly until ports are listening before releasing the lock
-wait_for_listen "${BACKEND_PORT}" 40 0.25 || true
-wait_for_listen "${FRONTEND_PORT}" 40 0.25 || true
+# Update registry with current project info
+echo "Updating port registry..."
+current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+registry_data=$(echo "$registry_data" | jq \
+  --arg project "$PROJECT_NAME" \
+  --argjson frontend_port "$FRONTEND_PORT" \
+  --argjson backend_port "$BACKEND_PORT" \
+  --arg last_used "$current_time" \
+  --argjson pid_frontend "$FRONT_PID" \
+  --argjson pid_backend "$BACK_PID" \
+  '.[$project] = {
+    "frontend_port": $frontend_port,
+    "backend_port": $backend_port,
+    "last_used": $last_used,
+    "pid_frontend": $pid_frontend,
+    "pid_backend": $pid_backend
+  }')
 
-# Release global lock if taken
-if [[ "$HAVE_LOCK" -eq 1 ]]; then
-  flock -u 200 || true
-fi
+write_registry "$registry_data"
+release_registry_lock
 
 echo "Servers are starting in background."
-echo "Backend:  http://${SERVER_HOST}:${BACKEND_PORT}  (pid: ${BACK_PID})"
-echo "Frontend: http://${SERVER_HOST}:${FRONTEND_PORT}  (pid: ${FRONT_PID})"
+echo "Backend:  http://localhost:${BACKEND_PORT}  (pid: ${BACK_PID})"
+echo "Frontend: http://localhost:${FRONTEND_PORT}  (pid: ${FRONT_PID})"
 echo "Logs: backend.log, frontend.log"
 
-# Stop both on exit
+# Stop both on exit and clean registry
 cleanup() {
   echo "Stopping servers..."
   kill "${BACK_PID}" "${FRONT_PID}" >/dev/null 2>&1 || true
+  
+  # Clean up PIDs from registry
+  echo "Cleaning up registry..."
+  acquire_registry_lock
+  local current_registry
+  current_registry=$(read_registry)
+  current_registry=$(echo "$current_registry" | jq \
+    --arg project "$PROJECT_NAME" \
+    '.[$project].pid_frontend = null | .[$project].pid_backend = null')
+  write_registry "$current_registry"
+  release_registry_lock
 }
 trap cleanup EXIT
 
 # Keep script running to keep trap active
 wait
-
-
