@@ -68,8 +68,18 @@ wait_for_listen() {
   return 1
 }
 
-FRONTEND_PORT="${FRONTEND_START_PORT:-$(find_free_port 3000)}"
-BACKEND_PORT="${BACKEND_START_PORT:-$(find_free_port 8000)}"
+# Derive deterministic offset from project name to avoid collisions across projects
+PROJECT_NAME="$(basename "$SCRIPT_DIR")"
+PORT_OFFSET=$(( $(echo -n "$PROJECT_NAME" | cksum | awk '{print $1}') % 100 ))
+DEFAULT_FRONT_START=$(( 3000 + PORT_OFFSET ))
+DEFAULT_BACK_START=$(( 8000 + PORT_OFFSET ))
+
+# Allow explicit overrides via env, else start from deterministic base and find next free
+FRONT_START="${FRONTEND_START_PORT:-$DEFAULT_FRONT_START}"
+BACK_START="${BACKEND_START_PORT:-$DEFAULT_BACK_START}"
+
+FRONTEND_PORT="$(find_free_port "$FRONT_START")"
+BACKEND_PORT="$(find_free_port "$BACK_START")"
 echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT}"
 
 # Prepared, constant site title (change here if needed)
