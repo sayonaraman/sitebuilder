@@ -117,9 +117,9 @@ BACK_PID=$!
 
 pushd frontend >/dev/null
 if [[ "${PKG}" == "yarn" ]]; then
-  PORT="${FRONTEND_PORT}" REACT_APP_BACKEND_URL="http://localhost:${BACKEND_PORT}" yarn start > ../frontend.log 2>&1 &
+  PORT="${FRONTEND_PORT}" REACT_APP_BACKEND_URL="http://${SERVER_HOST}:${BACKEND_PORT}" yarn start > ../frontend.log 2>&1 &
 else
-  PORT="${FRONTEND_PORT}" REACT_APP_BACKEND_URL="http://localhost:${BACKEND_PORT}" npm start > ../frontend.log 2>&1 &
+  PORT="${FRONTEND_PORT}" REACT_APP_BACKEND_URL="http://${SERVER_HOST}:${BACKEND_PORT}" npm start > ../frontend.log 2>&1 &
 fi
 FRONT_PID=$!
 popd >/dev/null
