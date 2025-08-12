@@ -70,17 +70,60 @@ wait_for_listen() {
 
 # Derive deterministic offset from project name to avoid collisions across projects
 PROJECT_NAME="$(basename "$SCRIPT_DIR")"
-PORT_OFFSET=$(( $(echo -n "$PROJECT_NAME" | cksum | awk '{print $1}') % 100 ))
+PORT_OFFSET=$(( $(echo -n "$PROJECT_NAME" | cksum | awk '{print $1}') % 900 ))
 DEFAULT_FRONT_START=$(( 3000 + PORT_OFFSET ))
 DEFAULT_BACK_START=$(( 8000 + PORT_OFFSET ))
 
-# Allow explicit overrides via env, else start from deterministic base and find next free
-FRONT_START="${FRONTEND_START_PORT:-$DEFAULT_FRONT_START}"
-BACK_START="${BACKEND_START_PORT:-$DEFAULT_BACK_START}"
+# Port registry persisted across projects to ensure unique stable assignments
+REGISTRY_FILE="/var/tmp/site_ports_registry"
+touch "$REGISTRY_FILE"
 
-FRONTEND_PORT="$(find_free_port "$FRONT_START")"
-BACKEND_PORT="$(find_free_port "$BACK_START")"
-echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT}"
+registry_get_line() {
+  grep -E "^${PROJECT_NAME}[[:space:]]" "$REGISTRY_FILE" | tail -1 || true
+}
+
+registry_port_taken() {
+  local port="$1"
+  grep -E "[[:space:]](FRONT=${port}|BACK=${port})([[:space:]]|$)" "$REGISTRY_FILE" >/dev/null 2>&1
+}
+
+registry_set_line() {
+  local front="$1"; local back="$2"
+  # remove old line and append new
+  grep -v -E "^${PROJECT_NAME}[[:space:]]" "$REGISTRY_FILE" > "${REGISTRY_FILE}.tmp" 2>/dev/null || true
+  mv -f "${REGISTRY_FILE}.tmp" "$REGISTRY_FILE" 2>/dev/null || true
+  echo "${PROJECT_NAME} FRONT=${front} BACK=${back}" >> "$REGISTRY_FILE"
+}
+
+# Decide ports
+EXPLICIT_FRONT="${FRONTEND_START_PORT:-}"
+EXPLICIT_BACK="${BACKEND_START_PORT:-}"
+if [[ -n "$EXPLICIT_FRONT" && -n "$EXPLICIT_BACK" ]]; then
+  FRONT_START="$EXPLICIT_FRONT"; BACK_START="$EXPLICIT_BACK"
+  FRONTEND_PORT="$(find_free_port "$FRONT_START")"
+  BACKEND_PORT="$(find_free_port "$BACK_START")"
+  registry_set_line "$FRONTEND_PORT" "$BACKEND_PORT"
+else
+  # check registry first
+  LINE="$(registry_get_line)"
+  if [[ -n "$LINE" ]]; then
+    FRONTEND_PORT="$(echo "$LINE" | sed -n 's/.*FRONT=\([0-9]\+\).*/\1/p')"
+    BACKEND_PORT="$(echo "$LINE" | sed -n 's/.*BACK=\([0-9]\+\).*/\1/p')"
+  fi
+  # If missing or currently busy, compute new unique ports
+  if [[ -z "${FRONTEND_PORT:-}" || -z "${BACKEND_PORT:-}" || is_port_in_use "$FRONTEND_PORT" || is_port_in_use "$BACKEND_PORT" ]]; then
+    FRONT_START="${EXPLICIT_FRONT:-$DEFAULT_FRONT_START}"
+    BACK_START="${EXPLICIT_BACK:-$DEFAULT_BACK_START}"
+    # ensure not taken in registry and not listening
+    CAND_F="$FRONT_START"; CAND_B="$BACK_START"
+    while registry_port_taken "$CAND_F" || is_port_in_use "$CAND_F"; do CAND_F=$((CAND_F+1)); done
+    while registry_port_taken "$CAND_B" || is_port_in_use "$CAND_B"; do CAND_B=$((CAND_B+1)); done
+    FRONTEND_PORT="$CAND_F"; BACKEND_PORT="$CAND_B"
+    registry_set_line "$FRONTEND_PORT" "$BACKEND_PORT"
+  fi
+fi
+
+echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT} (project ${PROJECT_NAME})"
 
 # Prepared, constant site title (change here if needed)
 SITE_TITLE="${SITE_TITLE:-test-pixbit.pro}"
