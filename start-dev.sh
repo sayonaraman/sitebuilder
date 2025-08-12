@@ -16,101 +16,68 @@ REGISTRY_PATH="$(dirname "$SCRIPT_DIR")/port-registry.json"
 echo "Project: $PROJECT_NAME"
 echo "Registry: $REGISTRY_PATH"
 
-# Pre-flight checks
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "[ERROR] python3 is not installed or not in PATH. Please install Python 3.10+." >&2
-  exit 1
-fi
-
-if ! command -v node >/dev/null 2>&1; then
-  echo "[ERROR] Node.js is not installed or not in PATH. Please install Node.js 18+." >&2
-  exit 1
-fi
-
-# Check if jq is available (optional)
-HAS_JQ=false
-if command -v jq >/dev/null 2>&1; then
-  HAS_JQ=true
-  echo "jq is available - will use registry"
-else
-  echo "jq not found - will use simple port allocation"
-fi
-
-# Simple port functions without complex registry logic
+# Simple port checking
 is_port_in_use() {
   local port="$1"
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -i TCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
-  else
-    ss -ltn | awk '{print $4}' | grep -E "(:|\])${port}$" >/dev/null 2>&1
+  ss -ltn | grep -q ":${port} " 2>/dev/null
+}
+
+# Get used ports from registry
+get_used_ports() {
+  if [[ -f "$REGISTRY_PATH" ]]; then
+    jq -r '.[] | "\(.frontend_port)\n\(.backend_port)"' "$REGISTRY_PATH" 2>/dev/null | grep -v null || true
   fi
 }
 
+# Find next free port
 find_free_port() {
   local start_port="$1"
+  local used_ports
+  used_ports=$(get_used_ports)
+  
   local port="$start_port"
-  while is_port_in_use "$port"; do
-    port=$((port + 1))
-  done
-  echo "$port"
-}
-
-# Simple registry functions
-read_simple_registry() {
-  if [[ -f "$REGISTRY_PATH" ]] && [[ "$HAS_JQ" == true ]]; then
-    cat "$REGISTRY_PATH" 2>/dev/null || echo "{}"
-  else
-    echo "{}"
-  fi
-}
-
-write_simple_registry() {
-  local data="$1"
-  if [[ "$HAS_JQ" == true ]]; then
-    echo "$data" > "$REGISTRY_PATH" || echo "Warning: Could not write registry"
-  fi
-}
-
-# Get ports - simple logic
-echo "Determining ports..."
-
-# Check existing registry if available
-FRONTEND_PORT=""
-BACKEND_PORT=""
-
-if [[ "$HAS_JQ" == true ]] && [[ -f "$REGISTRY_PATH" ]]; then
-  echo "Reading existing registry..."
-  existing_frontend=$(cat "$REGISTRY_PATH" 2>/dev/null | jq -r ".[\"$PROJECT_NAME\"].frontend_port // \"null\"" 2>/dev/null || echo "null")
-  existing_backend=$(cat "$REGISTRY_PATH" 2>/dev/null | jq -r ".[\"$PROJECT_NAME\"].backend_port // \"null\"" 2>/dev/null || echo "null")
-  
-  if [[ "$existing_frontend" != "null" ]] && [[ "$existing_backend" != "null" ]]; then
-    # Check if ports are available
-    if ! is_port_in_use "$existing_frontend" && ! is_port_in_use "$existing_backend"; then
-      FRONTEND_PORT="$existing_frontend"
-      BACKEND_PORT="$existing_backend"
-      echo "Reusing existing ports: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
+  while true; do
+    # Check if port is in system use
+    if is_port_in_use "$port"; then
+      port=$((port + 1))
+      continue
     fi
-  fi
-fi
+    
+    # Check if port is in registry
+    if echo "$used_ports" | grep -q "^$port$"; then
+      port=$((port + 1))
+      continue
+    fi
+    
+    echo "$port"
+    return
+  done
+}
 
-# If no existing ports, find new ones
-if [[ -z "$FRONTEND_PORT" ]] || [[ -z "$BACKEND_PORT" ]]; then
-  FRONTEND_PORT="${FRONTEND_START_PORT:-$(find_free_port 3000)}"
-  BACKEND_PORT="${BACKEND_START_PORT:-$(find_free_port 8000)}"
+# Get or assign ports
+if [[ -f "$REGISTRY_PATH" ]] && jq -e ".[\"$PROJECT_NAME\"]" "$REGISTRY_PATH" >/dev/null 2>&1; then
+  # Project exists in registry - reuse ports
+  FRONTEND_PORT=$(jq -r ".[\"$PROJECT_NAME\"].frontend_port" "$REGISTRY_PATH")
+  BACKEND_PORT=$(jq -r ".[\"$PROJECT_NAME\"].backend_port" "$REGISTRY_PATH")
+  echo "Reusing existing ports: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
+else
+  # New project - find free ports
+  FRONTEND_PORT=$(find_free_port 3000)
+  BACKEND_PORT=$(find_free_port 8000)
   
-  # Make sure backend port doesn't conflict with frontend
+  # Make sure backend doesn't conflict with frontend
   if [[ "$BACKEND_PORT" == "$FRONTEND_PORT" ]]; then
-    BACKEND_PORT=$(find_free_port $((BACKEND_PORT + 1)))
+    BACKEND_PORT=$(find_free_port $((FRONTEND_PORT + 1000)))
   fi
   
-  echo "Using new ports: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
+  echo "New project - allocated ports: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
 fi
 
-echo "Final ports: FRONTEND_PORT=${FRONTEND_PORT}, BACKEND_PORT=${BACKEND_PORT}"
+echo "Using ports: frontend=$FRONTEND_PORT, backend=$BACKEND_PORT"
 
-# Create root-level venv if missing
+# Create venv if missing
 if [[ ! -f "venv/bin/python" ]]; then
-  echo "Creating virtual environment in $PWD/venv ..."
+  echo "Creating virtual environment..."
   python3 -m venv venv
 fi
 
@@ -120,134 +87,107 @@ venv/bin/python -m pip install --upgrade pip
 echo "Installing backend dependencies..."
 venv/bin/python -m pip install -r backend/requirements.txt
 
-# Prepared, constant site title (change here if needed)
+# Environment setup
 SITE_TITLE="${SITE_TITLE:-test-pixbit.pro}"
 BUTTON_TEXT="${BUTTON_TEXT:-pixbit.pro}"
 BUTTON_HREF="${BUTTON_HREF:-https://pixbit.pro}"
 FAVICON_URL="${FAVICON_URL:-}"
 
-# Ensure backend .env exists with sensible defaults
+# Backend .env
 if [[ ! -f backend/.env ]]; then
-  echo "Creating backend/.env with defaults..."
-  {
-    echo "MONGO_URL=${MONGO_URL:-mongodb://localhost:27017}"
-    echo "DB_NAME=${DB_NAME:-advocat}"
-    echo "CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT}}"
-  } > backend/.env
+  echo "Creating backend/.env..."
+  cat > backend/.env << EOF
+MONGO_URL=${MONGO_URL:-mongodb://localhost:27017}
+DB_NAME=${DB_NAME:-advocat}
+CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT}}
+EOF
 fi
 
-# Ensure frontend .env exists with backend URL
+# Frontend .env
 SERVER_HOST_DEFAULT=$(hostname -I 2>/dev/null | awk '{print $1}') || true
 SERVER_HOST="${SERVER_HOST:-${SERVER_HOST_DEFAULT:-localhost}}"
-if [[ ! -f frontend/.env ]]; then
-  echo "Creating frontend/.env with defaults..."
-  echo "REACT_APP_BACKEND_URL=http://${SERVER_HOST}:${BACKEND_PORT}" > frontend/.env
-fi
+cat > frontend/.env << EOF
+REACT_APP_BACKEND_URL=http://${SERVER_HOST}:${BACKEND_PORT}
+EOF
 
-# Choose package manager for frontend (prefer yarn if available)
+# Choose package manager
 PKG="npm"
 if command -v yarn >/dev/null 2>&1; then
   PKG="yarn"
 fi
-echo "Using ${PKG} for frontend..."
 
-echo "Installing frontend dependencies..."
+echo "Installing frontend dependencies with $PKG..."
 pushd frontend >/dev/null
-if [[ "${PKG}" == "yarn" ]]; then
-  yarn install --frozen-lockfile || yarn install
+if [[ "$PKG" == "yarn" ]]; then
+  yarn install
 else
-  npm ci || npm install
+  npm install
 fi
 popd >/dev/null
 
-# Branding updates in public HTML
+# HTML branding updates
 INDEX_PATH="frontend/public/index.html"
-if [[ -f "${INDEX_PATH}" ]]; then
-  sed -i 's#<title>[^<]*</title>#<title>'"${SITE_TITLE}"'</title>#' "${INDEX_PATH}" || true
-  sed -i "s#Made with Emergent#${BUTTON_TEXT}#g" "${INDEX_PATH}" || true
-  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#https\?://app\\.emergent\\.sh[^'\"]*#${BUTTON_HREF}#g }" "${INDEX_PATH}" || true
-  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#Emergent#${BUTTON_TEXT}#g }" "${INDEX_PATH}" || true
-  sed -i -E "s#(<meta[^>]*name=[\"']description[\"'][^>]*content=[\"'][^\"']*)emergent\\.sh([^\"']*[\"'])#\1${BUTTON_TEXT}\2#I" "${INDEX_PATH}" || true
+if [[ -f "$INDEX_PATH" ]]; then
+  sed -i "s#<title>[^<]*</title>#<title>$SITE_TITLE</title>#" "$INDEX_PATH" || true
+  sed -i "s#Made with Emergent#$BUTTON_TEXT#g" "$INDEX_PATH" || true
+  sed -i "s#https://app.emergent.sh#$BUTTON_HREF#g" "$INDEX_PATH" || true
   
-  if [[ -n "${FAVICON_URL}" ]]; then
-    if grep -qi '<link[^>]*rel=["\'']icon' "${INDEX_PATH}"; then
-      sed -i -E "s#<link[^>]*rel=[\"']icon[\"'][^>]*>#<link rel=\"icon\" href=\"${FAVICON_URL}\"/>#Ig" "${INDEX_PATH}" || true
-    else
-      sed -i "s#</head>#  <link rel=\"icon\" href=\"${FAVICON_URL}\"/>\n</head>#" "${INDEX_PATH}" || true
+  if [[ -n "$FAVICON_URL" ]]; then
+    if ! grep -q 'rel="icon"' "$INDEX_PATH"; then
+      sed -i "s#</head>#  <link rel=\"icon\" href=\"$FAVICON_URL\"/>\n</head>#" "$INDEX_PATH" || true
     fi
   fi
 fi
 
-# Start backend and frontend
-echo "Starting servers..."
+# Update registry BEFORE starting services
+echo "Updating registry..."
+if [[ -f "$REGISTRY_PATH" ]]; then
+  # Update existing registry
+  jq --arg project "$PROJECT_NAME" \
+     --argjson frontend "$FRONTEND_PORT" \
+     --argjson backend "$BACKEND_PORT" \
+     '.[$project] = {"frontend_port": $frontend, "backend_port": $backend}' \
+     "$REGISTRY_PATH" > "$REGISTRY_PATH.tmp" && mv "$REGISTRY_PATH.tmp" "$REGISTRY_PATH"
+else
+  # Create new registry
+  jq -n --arg project "$PROJECT_NAME" \
+        --argjson frontend "$FRONTEND_PORT" \
+        --argjson backend "$BACKEND_PORT" \
+        '{($project): {"frontend_port": $frontend, "backend_port": $backend}}' \
+        > "$REGISTRY_PATH"
+fi
 
-# Ensure CORS aligns with selected ports
-export CORS_ORIGINS="${CORS_ORIGINS:-http://${SERVER_HOST}:${FRONTEND_PORT},http://localhost:${FRONTEND_PORT}}"
+echo "Registry updated successfully"
+
+# Start services
+echo "Starting servers..."
+export CORS_ORIGINS="http://$SERVER_HOST:$FRONTEND_PORT,http://localhost:$FRONTEND_PORT"
 
 # Start backend
-venv/bin/python -m uvicorn backend.server:app --reload --host 0.0.0.0 --port "${BACKEND_PORT}" > backend.log 2>&1 &
+venv/bin/python -m uvicorn backend.server:app --reload --host 0.0.0.0 --port "$BACKEND_PORT" > backend.log 2>&1 &
 BACK_PID=$!
 
-# Start frontend
+# Start frontend  
 pushd frontend >/dev/null
-if [[ "${PKG}" == "yarn" ]]; then
-  PORT="${FRONTEND_PORT}" REACT_APP_BACKEND_URL="http://${SERVER_HOST}:${BACKEND_PORT}" yarn start > ../frontend.log 2>&1 &
+if [[ "$PKG" == "yarn" ]]; then
+  PORT="$FRONTEND_PORT" yarn start > ../frontend.log 2>&1 &
 else
-  PORT="${FRONTEND_PORT}" REACT_APP_BACKEND_URL="http://${SERVER_HOST}:${BACKEND_PORT}" npm start > ../frontend.log 2>&1 &
+  PORT="$FRONTEND_PORT" npm start > ../frontend.log 2>&1 &
 fi
 FRONT_PID=$!
 popd >/dev/null
 
-# Update registry (simple version)
-if [[ "$HAS_JQ" == true ]]; then
-  echo "Updating port registry..."
-  current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  
-  # Create registry data
-  registry_entry="{
-  \"$PROJECT_NAME\": {
-    \"frontend_port\": $FRONTEND_PORT,
-    \"backend_port\": $BACKEND_PORT,
-    \"last_used\": \"$current_time\",
-    \"pid_frontend\": $FRONT_PID,
-    \"pid_backend\": $BACK_PID
-  }
-}"
-  
-  # Read existing registry and merge
-  if [[ -f "$REGISTRY_PATH" ]]; then
-    existing_registry=$(cat "$REGISTRY_PATH" 2>/dev/null || echo "{}")
-    # Use jq to merge
-    merged_registry=$(echo "$existing_registry" | jq --argjson new "$registry_entry" '. * $new' 2>/dev/null || echo "$registry_entry")
-    echo "$merged_registry" > "$REGISTRY_PATH"
-  else
-    # Create new registry
-    echo "$registry_entry" > "$REGISTRY_PATH"
-  fi
-  
-  echo "Registry updated: $REGISTRY_PATH"
-else
-  echo "Registry not available (jq not installed)"
-fi
-
-echo "Servers are starting in background."
-echo "Backend:  http://localhost:${BACKEND_PORT}  (pid: ${BACK_PID})"
-echo "Frontend: http://localhost:${FRONTEND_PORT}  (pid: ${FRONT_PID})"
+echo "Servers starting..."
+echo "Backend:  http://localhost:$BACKEND_PORT  (pid: $BACK_PID)"
+echo "Frontend: http://localhost:$FRONTEND_PORT  (pid: $FRONT_PID)"
 echo "Logs: backend.log, frontend.log"
 
-# Cleanup function
+# Simple cleanup on exit
 cleanup() {
   echo "Stopping servers..."
-  kill "${BACK_PID}" "${FRONT_PID}" >/dev/null 2>&1 || true
-  
-  # Clean up PIDs from registry
-  if [[ "$HAS_JQ" == true ]] && [[ -f "$REGISTRY_PATH" ]]; then
-    echo "Cleaning up registry..."
-    updated_registry=$(cat "$REGISTRY_PATH" 2>/dev/null | jq ".[\"$PROJECT_NAME\"].pid_frontend = null | .[\"$PROJECT_NAME\"].pid_backend = null" 2>/dev/null || cat "$REGISTRY_PATH")
-    echo "$updated_registry" > "$REGISTRY_PATH" 2>/dev/null || true
-  fi
+  kill "$BACK_PID" "$FRONT_PID" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-# Keep script running
+# Keep running
 wait
