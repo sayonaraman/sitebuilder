@@ -57,6 +57,7 @@ echo "Using FRONTEND_PORT=${FRONTEND_PORT} and BACKEND_PORT=${BACKEND_PORT}"
 
 # Prepared, constant site title (change here if needed)
 SITE_TITLE="${SITE_TITLE:-test-pixbit.pro}"
+BRAND_DOMAIN="${BRAND_DOMAIN:-pixbit.pro}"
 
 # Ensure backend .env exists with sensible defaults
 if [[ ! -f backend/.env ]]; then
@@ -68,10 +69,12 @@ if [[ ! -f backend/.env ]]; then
   } > backend/.env
 fi
 
-# Ensure frontend .env exists with backend URL
+# Ensure frontend .env exists with backend URL (use server IP if available)
+SERVER_HOST_DEFAULT=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+SERVER_HOST="${SERVER_HOST:-${SERVER_HOST_DEFAULT:-localhost}}"
 if [[ ! -f frontend/.env ]]; then
   echo "Creating frontend/.env with defaults..."
-  echo "REACT_APP_BACKEND_URL=http://localhost:${BACKEND_PORT}" > frontend/.env
+  echo "REACT_APP_BACKEND_URL=http://${SERVER_HOST}:${BACKEND_PORT}" > frontend/.env
 fi
 
 # Choose package manager for frontend (prefer yarn if available)
@@ -95,17 +98,21 @@ INDEX_PATH="frontend/public/index.html"
 if [[ -f "${INDEX_PATH}" ]]; then
   # 1) Title
   sed -i 's#<title>[^<]*</title>#<title>'"${SITE_TITLE}"'</title>#' "${INDEX_PATH}" || true
-  # 2) Replace only visible text label; do NOT touch scripts/links
-  sed -i 's#Made with Emergent#pixbit.pro#g' "${INDEX_PATH}" || true
+  # 2) Replace only in safe spots: visible badge text and its href; keep JS intact
+  sed -i "s#Made with Emergent#${BRAND_DOMAIN}#g" "${INDEX_PATH}" || true
+  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#https\?://app\\.emergent\\.sh[^'\"]*#https://${BRAND_DOMAIN}#g }" "${INDEX_PATH}" || true
+  sed -i "/id=\"emergent-badge\"/,/<\/a>/{ s#Emergent#${BRAND_DOMAIN}#g }" "${INDEX_PATH}" || true
+  # 3) Meta description line only, if contains emergent.sh
+  sed -i -E "s#(<meta[^>]*name=[\"']description[\"'][^>]*content=[\"'][^\"']*)emergent\\.sh([^\"']*[\"'])#\1${BRAND_DOMAIN}\2#I" "${INDEX_PATH}" || true
 fi
 
 # Start backend and frontend
 echo "Starting servers..."
 
-# Ensure CORS aligns with selected frontend port
-export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT}}"
+# Ensure CORS aligns with selected frontend port and server host
+export CORS_ORIGINS="${CORS_ORIGINS:-http://${SERVER_HOST}:${FRONTEND_PORT},http://localhost:${FRONTEND_PORT}}"
 
-venv/bin/python -m uvicorn backend.server:app --reload --port "${BACKEND_PORT}" > backend.log 2>&1 &
+venv/bin/python -m uvicorn backend.server:app --reload --host 0.0.0.0 --port "${BACKEND_PORT}" > backend.log 2>&1 &
 BACK_PID=$!
 
 pushd frontend >/dev/null
