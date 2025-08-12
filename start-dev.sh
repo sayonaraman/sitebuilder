@@ -9,6 +9,11 @@ echo "================================"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Global lock to avoid port race between multiple projects starting concurrently
+PORT_LOCK="/tmp/site_ports.lock"
+exec 200>"${PORT_LOCK}"
+flock 200
+
 # Pre-flight checks
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[ERROR] python3 is not installed or not in PATH. Please install Python 3.10+." >&2
@@ -49,6 +54,18 @@ find_free_port() {
     port=$((port + 1))
   done
   echo "$port"
+}
+
+# Wait until a port starts listening (or timeout)
+wait_for_listen() {
+  local port="$1"; local attempts="${2:-20}"; local sleep_s="${3:-0.5}"
+  local i=0
+  while (( i < attempts )); do
+    if is_port_in_use "$port"; then return 0; fi
+    i=$((i+1))
+    sleep "$sleep_s"
+  done
+  return 1
 }
 
 FRONTEND_PORT="${FRONTEND_START_PORT:-$(find_free_port 3000)}"
@@ -134,9 +151,16 @@ fi
 FRONT_PID=$!
 popd >/dev/null
 
+# Wait briefly until ports are listening before releasing the lock
+wait_for_listen "${BACKEND_PORT}" 40 0.25 || true
+wait_for_listen "${FRONTEND_PORT}" 40 0.25 || true
+
+# Release global lock
+flock -u 200
+
 echo "Servers are starting in background."
-echo "Backend:  http://localhost:${BACKEND_PORT}  (pid: ${BACK_PID})"
-echo "Frontend: http://localhost:${FRONTEND_PORT}  (pid: ${FRONT_PID})"
+echo "Backend:  http://${SERVER_HOST}:${BACKEND_PORT}  (pid: ${BACK_PID})"
+echo "Frontend: http://${SERVER_HOST}:${FRONTEND_PORT}  (pid: ${FRONT_PID})"
 echo "Logs: backend.log, frontend.log"
 
 # Stop both on exit
